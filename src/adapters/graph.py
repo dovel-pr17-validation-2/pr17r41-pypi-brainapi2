@@ -1,0 +1,957 @@
+"""
+File: /graph.py
+Created Date: Sunday October 19th 2025
+Author: Christian Nonis <alch.infoemail@gmail.com>
+-----
+Last Modified: Monday February 2nd 2026 10:02:37 pm
+Modified By: Christian Nonis <alch.infoemail@gmail.com>
+-----
+"""
+
+import re
+from abc import ABC, abstractmethod
+from typing import Dict, List, Literal, Optional, Tuple
+from src.adapters.interfaces.graph import GraphClient, PredicateWithFlowKey
+from src.core.saving.ingest_write_buffer import capture_operation, staged_nodes, writes_are_staged
+from src.constants.embeddings import Vector
+from src.constants.kg import (
+    IdentificationParams,
+    Node,
+    NodeDict,
+    Predicate,
+    PredicateDict,
+    SearchEntitiesResult,
+    SearchRelationshipsResult,
+)
+from src.adapters.interfaces.embeddings import VectorStoreClient
+from src.adapters.graph_operation_result_serializer import (
+    serialize_graph_operation_result,
+)
+from src.core.search.traverse import (
+    MAX_TRAVERSE_DEPTH,
+    MAX_TRAVERSE_HOPS,
+    flatten_neighborhood,
+)
+from src.utils.normalization.list_reduction import reduce_list
+from src.utils.similarity.vectors import cosine_similarity
+
+
+class NeighborVectorReductionStrategy(ABC):
+    @abstractmethod
+    def prefilter(
+        self,
+        vectors_with_desc: list[dict],
+        averaged_vector: list[float],
+        description: Optional[str],
+    ) -> list[dict]:
+        raise NotImplementedError
+
+
+class SimilarityOnlyReductionStrategy(NeighborVectorReductionStrategy):
+    def prefilter(
+        self,
+        vectors_with_desc: list[dict],
+        averaged_vector: list[float],
+        description: Optional[str],
+    ) -> list[dict]:
+        return vectors_with_desc
+
+
+class DescriptionAwareReductionStrategy(NeighborVectorReductionStrategy):
+    def prefilter(
+        self,
+        vectors_with_desc: list[dict],
+        averaged_vector: list[float],
+        description: Optional[str],
+    ) -> list[dict]:
+        if not description:
+            return vectors_with_desc
+        return reduce_list(
+            vectors_with_desc,
+            access_key="embeddings",
+            similarity_threshold=0.8,
+            by_vector=averaged_vector,
+            rerank={
+                "local": "description",
+                "with_": description,
+            },
+        )
+
+
+class NeighborVectorReductionStrategyFactory:
+    def create(self, description: Optional[str]) -> NeighborVectorReductionStrategy:
+        if description:
+            return DescriptionAwareReductionStrategy()
+        return SimilarityOnlyReductionStrategy()
+
+
+class GraphAdapter:
+    """
+    Adapter for the graph client.
+    """
+
+    def __init__(
+        self, reduction_strategy_factory: Optional[NeighborVectorReductionStrategyFactory] = None
+    ):
+        self.graph = None
+        self._reduction_strategy_factory = (
+            reduction_strategy_factory or NeighborVectorReductionStrategyFactory()
+        )
+
+    @property
+    def graphdb_type(self) -> str:
+        """
+        This is the type of the graph database.
+        It is used to let the agent know which syntax to use.
+        """
+        return self.graph.graphdb_type
+
+    @property
+    def graphdb_description(self) -> str:
+        """
+        This is the description of the graph database.
+        It is used to let the agent know which syntax to use.
+        """
+        return self.graph.graphdb_description
+
+    def add_client(self, client: GraphClient) -> None:
+        """
+        Add a graph client to the adapter.
+        """
+        self.graph = client
+
+    def execute_operation(self, operation: str, brain_id: str = "default") -> str:
+        """
+        Execute a generic graph operation.
+        """
+        try:
+            result = self.graph.execute_operation(operation, brain_id)
+            return serialize_graph_operation_result(result)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            hint = ""
+            backend = getattr(self.graph, "graphdb_type", "") or ""
+            if "postgresql" in backend and re.search(
+                r"\bMATCH\b|\bRETURN\b|\bFROM\s+nodes\b", operation or "", re.I
+            ):
+                hint = (
+                    " Hint: this backend expects SQL on kg_nodes/kg_relationships, "
+                    "not Cypher and not a table named nodes."
+                )
+            print(f"Error executing graph operation: {e} - {operation}")
+            return f"Error executing graph operation: {e}.{hint}"
+
+    def add_nodes(
+        self,
+        nodes: list[Node],
+        brain_id: str = "default",
+        identification_params: Optional[dict] = None,
+        metadata: Optional[dict] = None,
+    ) -> list[Node] | str:
+        """
+        Add nodes to the graph.
+        """
+        if writes_are_staged():
+            capture_operation(brain_id, {
+                "adapter": "graph",
+                "method": "add_nodes",
+                "args": {
+                    "nodes": [node.model_dump(mode="json") for node in nodes],
+                    "identification_params": identification_params,
+                    "metadata": metadata,
+                },
+            })
+            return nodes
+        return self.graph.add_nodes(nodes, brain_id, identification_params, metadata)
+
+    def add_relationship(
+        self,
+        subject: Node,
+        predicate: Predicate,
+        to_object: Node,
+        brain_id: str = "default",
+    ) -> str:
+        """
+        Add a relationship between two nodes to the graph.
+        """
+        if writes_are_staged():
+            capture_operation(brain_id, {
+                "adapter": "graph",
+                "method": "add_relationship",
+                "args": {
+                    "subject": subject.model_dump(mode="json"),
+                    "predicate": predicate.model_dump(mode="json"),
+                    "to_object": to_object.model_dump(mode="json"),
+                },
+            })
+            return predicate.uuid
+        return self.graph.add_relationship(subject, predicate, to_object, brain_id)
+
+    def search_graph(
+        self,
+        nodes: list[Node],
+        brain_id: str = "default",
+    ) -> list[Node]:
+        """
+        Search the graph for nodes and 1 degree relationships.
+        """
+        return self.graph.search_graph(nodes, brain_id)
+
+    def node_text_search(self, text: str, brain_id: str = "default") -> list[Node]:
+        """
+        Search the graph for nodes by partial text match into the name of the nodes.
+        """
+        return self.graph.node_text_search(text, brain_id)
+
+    def get_nodes_by_uuid(
+        self,
+        uuids: list[str],
+        brain_id: str = "default",
+        with_relationships: Optional[bool] = False,
+        relationships_depth: Optional[int] = 1,
+        relationships_type: Optional[list[str]] = None,
+        preferred_labels: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """
+        Get nodes by their UUIDs with optional relationships and preferred labels.
+        """
+        return self.graph.get_nodes_by_uuid(
+            uuids,
+            brain_id,
+            with_relationships,
+            relationships_depth,
+            relationships_type,
+            preferred_labels,
+        )
+
+    def get_graph_entities(self, brain_id: str = "default") -> list[str]:
+        """
+        Get the entities of the graph.
+        """
+        return self.graph.get_graph_entities(brain_id)
+
+    def get_graph_relationships(self, brain_id: str = "default") -> list[str]:
+        """
+        Retrieve relationship type names available in the graph.
+
+        Parameters:
+            brain_id (str): Identifier of the graph/brain to query.
+
+        Returns:
+            list[str]: Relationship type names present in the specified graph.
+        """
+        return self.graph.get_graph_relationships(brain_id)
+
+    def get_by_uuid(self, uuid: str, brain_id: str = "default") -> Node:
+        """
+        Retrieve a node by its UUID from the graph.
+
+        Deprecated: use `get_by_uuids` for batch retrieval.
+
+        Parameters:
+            uuid (str): UUID of the node to retrieve.
+            brain_id (str): Identifier of the graph/brain to query.
+
+        Returns:
+            Node: The node matching the provided UUID.
+        """
+        staged = staged_nodes(brain_id, [uuid])
+        if uuid in staged:
+            return Node.model_validate(staged[uuid])
+        return self.graph.get_by_uuid(uuid, brain_id)
+
+    def get_by_uuids(self, uuids: list[str], brain_id: str = "default") -> list[Node]:
+        """
+        Get nodes by their UUIDs.
+        """
+        staged = staged_nodes(brain_id, uuids)
+        if not staged:
+            return self.graph.get_by_uuids(uuids, brain_id)
+        missing = [uuid for uuid in uuids if uuid not in staged]
+        live = self.graph.get_by_uuids(missing, brain_id) if missing else []
+        return [*live, *(Node.model_validate(node) for node in staged.values())]
+
+    def get_by_identification_params(
+        self,
+        identification_params: IdentificationParams,
+        brain_id: str = "default",
+        entity_types: Optional[list[str]] = None,
+    ) -> Node:
+        """
+        Get a node by its identification params and entity types.
+        """
+        return self.graph.get_by_identification_params(
+            identification_params, brain_id, entity_types
+        )
+
+    def get_neighbors(
+        self,
+        nodes: list[Node | str],
+        same_type_only: bool = False,
+        limit: int | None = None,
+        of_types: Optional[list[str]] = None,
+        brain_id: str = "default",
+    ) -> Dict[str, List[Tuple[Predicate, Node]]]:
+        """
+        Get the neighbors of a node.
+        """
+        return self.graph.get_neighbors(
+            nodes,
+            brain_id=brain_id,
+            same_type_only=same_type_only,
+            limit=limit,
+            of_types=of_types,
+        )
+
+    def get_event_centric_neighbors(
+        self,
+        nodes: list[Node | str],
+        brain_id: str = "default",
+    ) -> List[Tuple[Node, Predicate, Node, Predicate, Node]]:
+        """
+        Get the event-centric neighbors of a node.
+        """
+        return self.graph.get_event_centric_neighbors(nodes, brain_id)
+
+    def get_node_with_rel_by_uuid(
+        self, rel_ids_with_node_ids: list[tuple[str, str]], brain_id: str = "default"
+    ) -> list[dict]:
+        """
+        Get the node with the relationships by their UUIDs.
+        """
+        return self.graph.get_node_with_rel_by_uuid(rel_ids_with_node_ids, brain_id)
+
+    def get_neighbor_node_tuples(
+        self, a_uuid: str, b_uuids: list[str], brain_id: str = "default"
+    ) -> list[Tuple[Node, Predicate, Node]]:
+        """
+        Get the neighbor node tuples by their UUIDs.
+        """
+        return self.graph.get_neighbor_node_tuples(a_uuid, b_uuids, brain_id)
+
+    def get_connected_nodes(
+        self,
+        brain_id: str = "default",
+        node: Optional[Node] = None,
+        uuids: Optional[list[str]] = None,
+        limit: Optional[int] = 10,
+        with_labels: Optional[list[str]] = None,
+    ) -> list[Tuple[Node, Predicate, Node]]:
+        """
+        Get the connected nodes by their UUIDs.
+        """
+        return self.graph.get_connected_nodes(
+            brain_id, node=node, uuids=uuids, limit=limit, with_labels=with_labels
+        )
+
+    def search_relationships(
+        self,
+        brain_id: str = "default",
+        limit: int = 10,
+        skip: int = 0,
+        relationship_types: Optional[list[str]] = None,
+        from_node_labels: Optional[list[str]] = None,
+        to_node_labels: Optional[list[str]] = None,
+        query_text: Optional[str] = None,
+        query_search_target: Optional[str] = "all",
+    ) -> SearchRelationshipsResult:
+        """
+        Search the relationships of the graph.
+        """
+        relationship_uuids = []
+        return self.graph.search_relationships(
+            brain_id,
+            limit,
+            skip,
+            relationship_types,
+            from_node_labels,
+            to_node_labels,
+            relationship_uuids,
+            query_text,
+            query_search_target,
+        )
+
+    def search_entities(
+        self,
+        brain_id: str = "default",
+        limit: int = 10,
+        skip: int = 0,
+        node_labels: Optional[list[str]] = None,
+        query_text: Optional[str] = None,
+    ) -> SearchEntitiesResult:
+        """
+        Search the entities of the graph.
+        """
+        node_uuids = []
+        return self.graph.search_entities(
+            brain_id, limit, skip, node_labels, node_uuids, query_text
+        )
+
+    def search_nodes_bm25(
+        self,
+        query_text: str,
+        brain_id: str = "default",
+        *,
+        limit: int = 10,
+        node_labels: Optional[list[str]] = None,
+        node_uuids: Optional[list[str]] = None,
+    ):
+        method = getattr(self.graph, "search_nodes_bm25", None)
+        if method is None:
+            return []
+        return method(
+            query_text,
+            brain_id,
+            limit=limit,
+            node_labels=node_labels,
+            node_uuids=node_uuids,
+        )
+
+    def deprecate_relationship(
+        self,
+        subject: Node,
+        predicate: Predicate,
+        object: Node,
+        brain_id: str = "default",
+    ) -> Tuple[Node, Predicate, Node] | None:
+        """
+        Deprecate a relationship from the graph.
+        """
+        if writes_are_staged():
+            capture_operation(brain_id, {
+                "adapter": "graph",
+                "method": "deprecate_relationship",
+                "args": {
+                    "subject": subject.model_dump(mode="json"),
+                    "predicate": predicate.model_dump(mode="json"),
+                    "to_object": object.model_dump(mode="json"),
+                },
+            })
+            return subject, predicate, object
+        return self.graph.deprecate_relationship(subject, predicate, object, brain_id)
+
+    def update_properties(
+        self,
+        uuid: str,
+        updating: Literal["node", "relationship"],
+        brain_id: str = "default",
+        new_properties: Optional[dict] = None,
+        properties_to_remove: Optional[list[str]] = None,
+    ) -> Node | Predicate | None:
+        """
+        Update properties on a graph node or relationship.
+
+        Parameters:
+                uuid (str): UUID of the node or relationship to update.
+                updating (Literal["node", "relationship"]): Target entity type to update.
+                brain_id (str): Identifier of the graph (defaults to "default").
+                new_properties (dict): Properties to add or replace on the entity.
+                properties_to_remove (list[str]): Names of properties to remove from the entity.
+
+        Returns:
+                Node | Predicate | None: The updated entity, or `None` if the entity was not found.
+        """
+        if new_properties is None:
+            new_properties = {}
+        if properties_to_remove is None:
+            properties_to_remove = []
+        if capture_operation(brain_id, {
+            "adapter": "graph",
+            "method": "update_properties",
+            "args": {
+                "uuid": uuid,
+                "updating": updating,
+                "new_properties": new_properties,
+                "properties_to_remove": properties_to_remove,
+            },
+        }):
+            return None
+        return self.graph.update_properties(
+            uuid, updating, brain_id, new_properties, properties_to_remove
+        )
+
+    def get_graph_relationship_types(self, brain_id: str = "default") -> list[str]:
+        """
+        Retrieve all relationship type names present in the graph.
+
+        Parameters:
+            brain_id (str): Identifier of the graph (brain) to query. Defaults to "default".
+
+        Returns:
+            list[str]: List of unique relationship type names found in the graph.
+        """
+        return self.graph.get_graph_relationship_types(brain_id)
+
+    def get_graph_node_types(self, brain_id: str = "default") -> list[str]:
+        """
+        Get all unique node types stored in the graph.
+
+        Returns:
+            list[str]: Node type names available in the graph.
+        """
+        return self.graph.get_graph_node_types(brain_id)
+
+    def get_graph_node_properties(self, brain_id: str = "default") -> list[str]:
+        """
+        Return all unique node property keys present in the graph for the specified brain.
+
+        Returns:
+            list[str]: Unique node property key names present in the specified brain's graph.
+        """
+        return self.graph.get_graph_node_properties(brain_id)
+
+    def update_node(
+        self,
+        uuid: str,
+        brain_id: str = "default",
+        new_name: Optional[str] = None,
+        new_description: Optional[str] = None,
+        new_labels: Optional[list[str]] = None,
+        new_properties: Optional[dict] = None,
+        properties_to_remove: Optional[list[str]] = None,
+    ) -> Node | None:
+        """
+        Update an existing node's identifying fields, labels, and properties in the graph.
+
+        Parameters:
+            uuid (str): UUID of the node to update.
+            brain_id (str): Identifier of the brain/graph where the node resides.
+            new_name (Optional[str]): New name for the node; leave None to keep the current name.
+            new_description (Optional[str]): New description for the node; leave None to keep the current description.
+            new_labels (Optional[list[str]]): New set of labels for the node; provide to replace the node's labels.
+            new_properties (Optional[dict]): Properties to add or update on the node; keys are property names and values are their new values.
+            properties_to_remove (Optional[list[str]]): List of property names to remove from the node.
+
+        Returns:
+            Node | None: The updated node if the update succeeded, or `None` if the node was not found.
+        """
+        return self.graph.update_node(
+            uuid,
+            brain_id,
+            new_name,
+            new_description,
+            new_labels,
+            new_properties,
+            properties_to_remove,
+        )
+
+    def get_schema(self, brain_id: str = "default") -> dict:
+        """
+        Get the schema/ontology of the graph.
+        """
+        return self.graph.get_schema(brain_id)
+
+    def _reduce_neighbor_vectors(
+        self,
+        vectors_with_desc: list[dict],
+        averaged_vector: list[float],
+        similarity_threshold: float,
+        description: Optional[str],
+    ) -> set[str]:
+        if not vectors_with_desc or not averaged_vector:
+            return set()
+        strategy = self._reduction_strategy_factory.create(description)
+        reduced_vectors = strategy.prefilter(
+            vectors_with_desc=vectors_with_desc,
+            averaged_vector=averaged_vector,
+            description=description,
+        )
+        filtered_uuids = set()
+        for vector in reduced_vectors:
+            vector_uuid = vector.get("metadata", {}).get("uuid")
+            embeddings = vector.get("embeddings")
+            if (
+                not vector_uuid
+                or not embeddings
+                or not isinstance(embeddings, list)
+                or len(embeddings) != len(averaged_vector)
+            ):
+                continue
+            if cosine_similarity(averaged_vector, embeddings) >= similarity_threshold:
+                filtered_uuids.add(vector_uuid)
+        return filtered_uuids
+
+    def _average_embeddings(self, vectors: list[Vector]) -> list[float]:
+        valid_embeddings = [
+            vector.embeddings for vector in vectors if isinstance(vector.embeddings, list) and vector.embeddings
+        ]
+        if not valid_embeddings:
+            return []
+        dimension = len(valid_embeddings[0])
+        same_dimension_embeddings = [
+            embedding for embedding in valid_embeddings if len(embedding) == dimension
+        ]
+        if not same_dimension_embeddings:
+            return []
+        return [
+            sum(embedding[i] for embedding in same_dimension_embeddings)
+            / len(same_dimension_embeddings)
+            for i in range(dimension)
+        ]
+
+    def get_2nd_degree_hops(
+        self,
+        from_uuids: List[str],
+        flattened: bool,
+        vector_store_adapter: VectorStoreClient,
+        brain_id: str = "default",
+        similarity_threshold: float = 0.0,
+    ) -> List[Tuple[Node, List[Tuple[Predicate, Node, List[Tuple[Predicate, Node]]]]]]:
+        """
+        Compute second-degree neighbor hops for the given starting node UUIDs using vector-store–based filtering.
+
+        Parameters:
+            from_uuids: List[str] — UUIDs of the starting nodes to explore.
+            flattened: bool — When true, nodes and predicates are returned as lightweight dicts with core fields (`uuid`, `name`, `labels`/`direction`) instead of full objects.
+            vector_store_adapter: VectorStoreClient — Vector store used to fetch embeddings and perform similarity-based filtering.
+            brain_id: str — Identifier of the brain/graph space to query.
+            similarity_threshold: float — Optional threshold for additional similarity-based filtering (0.0 disables the extra check).
+
+        Returns:
+            List[Tuple[Node, List[Tuple[Predicate, Node, List[Tuple[Predicate, Node]]]]]] — A list where each item corresponds to a starting node and contains:
+                - the starting node (or its flattened representation),
+                - a list of first-degree entries, each being a tuple of (predicate, first-degree node, list of second-degree (predicate, node) tuples).
+        """
+
+        def flatten_node(n):
+            """
+            Return a flattened node representation when the surrounding `flattened` flag is true, otherwise return the original node.
+
+            Parameters:
+                n: Node
+                    The node to convert.
+
+            Returns:
+                dict: A dictionary with keys `uuid`, `labels`, and `name` when `flattened` is true, otherwise the original node object.
+            """
+            return (
+                {"uuid": n.uuid, "labels": n.labels, "name": n.name} if flattened else n
+            )
+
+        def flatten_pred(p):
+            return (
+                {"uuid": p.uuid, "name": p.name, "direction": p.direction}
+                if flattened
+                else p
+            )
+
+        nodes = self.get_by_uuids(from_uuids, brain_id)
+        nodes_by_uuid = {n.uuid: n for n in nodes}
+
+        v_ids = [
+            n.properties["v_id"] for n in nodes if n.properties.get("v_id") is not None
+        ]
+        if len(v_ids) == 0:
+            print(
+                "[ ! ] No v_ids found for nodes:", from_uuids
+            )  # TODO: no node without v_id exists in the graph, check why this is happening
+            print(f"[DEBUG (get_2nd_degree_hops)]: Nodes: {nodes}")
+            return []
+
+        vs = vector_store_adapter.get_by_ids(v_ids, brain_id=brain_id, store="nodes")
+        if len(vs) == 0:
+            print("[ ! ] No vectors found for nodes:", from_uuids)
+            return []
+
+        averaged_vector = self._average_embeddings(vs)
+        if len(averaged_vector) == 0:
+            print("[ ! ] No valid embeddings found for nodes:", from_uuids)
+            return []
+
+        all_fd_nodes = self.get_neighbors(list(nodes_by_uuid.keys()), brain_id=brain_id)
+
+        all_fd_v_ids: List[str] = [
+            fd[1].properties["v_id"]
+            for fds in all_fd_nodes.values()
+            for fd in fds
+            if fd[1].properties.get("v_id") is not None
+        ]  # TODO: [missing_property] check why sometime v_id is not present
+        all_fd_vs = (
+            vector_store_adapter.get_by_ids(all_fd_v_ids, brain_id=brain_id, store="nodes")
+            if len(all_fd_v_ids) > 0
+            else []
+        )
+        fd_vs_by_uuid: Dict[str, Vector] = {v.metadata["uuid"]: v for v in all_fd_vs}
+
+        all_filtered_fd_uuids: set[str] = set()
+        filtered_fd_by_origin: Dict[str, List[Tuple[Predicate, Node]]] = {}
+
+        for node_uuid, fd_list in all_fd_nodes.items():
+            fd_nodes_by_uuid = {fd[1].uuid: fd[1] for fd in fd_list}
+            fd_vs_with_desc = [
+                {
+                    "embeddings": fd_vs_by_uuid[fd[1].uuid].embeddings,
+                    "metadata": fd_vs_by_uuid[fd[1].uuid].metadata,
+                    "description": (
+                        fd_nodes_by_uuid.get(fd[1].uuid, {}).description
+                        if fd_nodes_by_uuid.get(fd[1].uuid)
+                        else None
+                    ),
+                }
+                for fd in fd_list
+                if fd[1].uuid in fd_vs_by_uuid
+            ]
+            from_node = nodes_by_uuid[node_uuid]
+            filtered_uuids = self._reduce_neighbor_vectors(
+                vectors_with_desc=fd_vs_with_desc,
+                averaged_vector=averaged_vector,
+                similarity_threshold=similarity_threshold,
+                description=from_node.description,
+            )
+            filtered_fd_by_origin[node_uuid] = [
+                fd for fd in fd_list if fd[1].uuid in filtered_uuids
+            ]
+            all_filtered_fd_uuids.update(filtered_uuids)
+
+        all_sd_nodes = (
+            self.get_neighbors(list(all_filtered_fd_uuids), brain_id=brain_id)
+            if len(all_filtered_fd_uuids) > 0
+            else {}
+        )
+
+        all_sd_v_ids: List[str] = [
+            getattr(sd[1], "properties", {}).get("v_id")
+            for sds in all_sd_nodes.values()
+            for sd in sds
+            if getattr(sd[1], "properties", {}).get(
+                "v_id"
+            )  # TODO: [missing_property] check why sometime v_id is not present
+        ]
+        all_sd_vs = (
+            vector_store_adapter.get_by_ids(all_sd_v_ids, brain_id=brain_id, store="nodes")
+            if len(all_sd_v_ids) > 0
+            else []
+        )
+        sd_vs_by_uuid = {v.metadata["uuid"]: v for v in all_sd_vs}
+
+        hops = []
+        exclude_set = set(from_uuids)
+
+        for from_uuid in from_uuids:
+            if from_uuid not in nodes_by_uuid:
+                continue
+            from_node = nodes_by_uuid[from_uuid]
+            node_hops = []
+
+            for fd_pred, fd_node in filtered_fd_by_origin.get(from_uuid, []):
+                sd_list = all_sd_nodes.get(fd_node.uuid, [])
+                sd_nodes_by_uuid = {sd[1].uuid: sd[1] for sd in sd_list}
+
+                sd_vs_with_desc = [
+                    {
+                        "embeddings": sd_vs_by_uuid[sd[1].uuid].embeddings,
+                        "metadata": sd_vs_by_uuid[sd[1].uuid].metadata,
+                        "description": (
+                            sd_nodes_by_uuid.get(sd[1].uuid, {}).description
+                            if sd_nodes_by_uuid.get(sd[1].uuid)
+                            else None
+                        ),
+                    }
+                    for sd in sd_list
+                    if sd[1].uuid in sd_vs_by_uuid
+                ]
+
+                reduced_uuids = self._reduce_neighbor_vectors(
+                    vectors_with_desc=sd_vs_with_desc,
+                    averaged_vector=averaged_vector,
+                    similarity_threshold=similarity_threshold,
+                    description=from_node.description,
+                )
+
+                second_degree = [
+                    (flatten_pred(sd[0]), flatten_node(sd[1]))
+                    for sd in sd_list
+                    if sd[1].uuid in reduced_uuids
+                    and sd[1].uuid not in exclude_set
+                    and sd[1].uuid != from_uuid
+                ]
+
+                node_hops.append(
+                    (flatten_pred(fd_pred), flatten_node(fd_node), second_degree)
+                )
+
+            hops.append((flatten_node(from_node), node_hops))
+
+        return hops
+
+    def check_node_existence(
+        self,
+        uuid: str,
+        name: str,
+        labels: list[str],
+        brain_id: str = "default",
+    ) -> bool:
+        """
+        Determine whether a node with the given UUID, name, and labels exists in the graph.
+
+        Parameters:
+                uuid (str): UUID of the node to check; may be empty if matching by name and labels.
+                name (str): Name of the node to match.
+                labels (list[str]): List of labels/types the node must have.
+                brain_id (str): Identifier of the graph/brain to query; defaults to "default".
+
+        Returns:
+                true if a matching node exists, false otherwise.
+        """
+        if uuid and uuid in staged_nodes(brain_id, [uuid]):
+            return True
+        return self.graph.check_node_existence(uuid, name, labels, brain_id)
+
+    def get_neighborhood(
+        self, node: Node | str, depth: int, brain_id: str = "default"
+    ) -> list[dict]:
+        """
+        Get the neighborhood of a node up to a given depth.
+        Returns a nested structure where each neighbor contains its own neighbors.
+        """
+        return self.graph.get_neighborhood(node, depth, brain_id)
+
+    def traverse_graph(
+        self,
+        *,
+        brain_id: str = "default",
+        start_uuid: str | None = None,
+        start_name: str | None = None,
+        start_labels: list[str] | None = None,
+        depth: int = 2,
+        rel_types: list[str] | None = None,
+        node_labels: list[str] | None = None,
+        direction: Literal["in", "out", "both"] = "both",
+        limit: int = 50,
+    ) -> dict:
+        depth = max(1, min(depth, MAX_TRAVERSE_DEPTH))
+        limit = max(1, min(limit, MAX_TRAVERSE_HOPS))
+
+        if start_uuid:
+            start_node = self.get_by_uuid(start_uuid, brain_id)
+        elif start_name and start_labels:
+            start_node = self.get_by_identification_params(
+                IdentificationParams(name=start_name),
+                brain_id,
+                entity_types=start_labels,
+            )
+        else:
+            return {
+                "error": "Provide start_uuid or both start_name and start_labels",
+            }
+
+        if start_node is None:
+            return {"error": "Start node not found"}
+
+        neighborhood = self.get_neighborhood(start_node.uuid, depth, brain_id)
+        hops, truncated = flatten_neighborhood(
+            neighborhood,
+            rel_types=rel_types,
+            node_labels=node_labels,
+            direction=direction,
+            limit=limit,
+        )
+        return {
+            "start": start_node.model_dump(mode="json"),
+            "depth": depth,
+            "hops": hops,
+            "truncated": truncated,
+        }
+
+    def get_nexts_by_flow_key(
+        self,
+        predicates: list[PredicateWithFlowKey],
+        brain_id: str = "default",
+    ) -> Dict[str, List[Tuple[Node, Predicate, Node]]]:
+        """
+        Retrieve the next connected node tuple(s) for a relationship identified by a flow key, grouped by the predicate UUID.
+
+        Parameters:
+            predicates (list[PredicateWithFlowKey]): A list of predicates with their flow keys.
+            brain_id (str): Identifier of the brain/graph namespace to query.
+
+        Returns:
+            Dict[str, List[Tuple[Node, Predicate, Node]]]: A dictionary mapping predicate UUIDs to lists of (subject node, predicate, object node) tuples that are the next nodes matching the provided flow key; empty dictionary if none are found for any predicate UUID.
+        """
+        return self.graph.get_nexts_by_flow_key(predicates, brain_id)
+
+    def get_triples_by_uuid(
+        self, uuids: list[str], brain_id: str
+    ) -> List[Tuple[Node, Predicate, Node]]:
+        """
+        Get triples by its UUIDs.
+        """
+        return self.graph.get_triples_by_uuid(uuids, brain_id)
+
+    def remove_nodes(self, uuids: list[str], brain_id: str = "default") -> list[Node]:
+        """
+        Remove nodes from the graph.
+        """
+        return self.graph.remove_nodes(uuids, brain_id)
+
+    def remove_relationships(
+        self,
+        relationships: list[Tuple[NodeDict, PredicateDict, NodeDict]],
+        brain_id: str = "default",
+    ) -> list[Tuple[Node, Predicate, Node]]:
+        """
+        Remove relationships from the graph.
+        """
+        return self.graph.remove_relationships(relationships, brain_id)
+
+    def list_relationships(
+        self,
+        subject: str,
+        object: str,
+        brain_id: str = "default",
+    ) -> list[Tuple[Node, Predicate, Node]]:
+        """
+        List the relationships between the subject and object.
+        """
+        return self.graph.list_relationships(subject, object, brain_id)
+
+    def get_event_hub_facts(
+        self,
+        event_uuids: list[str],
+        brain_id: str = "default",
+    ) -> list:
+        return self.graph.get_event_hub_facts(event_uuids, brain_id)
+
+    def rebuild_hub_bridge_index(self, brain_id: str = "default") -> int:
+        if capture_operation(brain_id, {
+            "adapter": "graph", "method": "rebuild_hub_bridge_index", "args": {},
+        }):
+            return 0
+        return self.graph.rebuild_hub_bridge_index(brain_id)
+
+    def refresh_hub_bridges_for_entities(
+        self, entity_uuids: list, brain_id: str = "default"
+    ) -> int:
+        if capture_operation(brain_id, {
+            "adapter": "graph", "method": "refresh_hub_bridges_for_entities", "args": {"entity_uuids": list(entity_uuids or [])},
+        }):
+            return 0
+        refresh = getattr(self.graph, "refresh_hub_bridges_for_entities", None)
+        if refresh is None:
+            return self.rebuild_hub_bridge_index(brain_id)
+        return int(refresh(brain_id, list(entity_uuids or [])) or 0)
+
+    def get_hub_bridges(
+        self,
+        event_uuids: list[str],
+        brain_id: str = "default",
+    ) -> list:
+        return self.graph.get_hub_bridges(event_uuids, brain_id)
+
+    def rebuild_topic_index(self, brain_id: str = "default") -> int:
+        if capture_operation(brain_id, {
+            "adapter": "graph", "method": "rebuild_topic_index", "args": {},
+        }):
+            return 0
+        rebuild = getattr(self.graph, "rebuild_topic_index", None)
+        if rebuild is None:
+            return 0
+        return int(rebuild(brain_id) or 0)
+
+    def list_topic_memberships(self, brain_id: str = "default") -> list:
+        listing = getattr(self.graph, "list_topic_memberships", None)
+        if listing is None:
+            return []
+        return list(listing(brain_id) or [])
+
+
+_graph_adapter = GraphAdapter()

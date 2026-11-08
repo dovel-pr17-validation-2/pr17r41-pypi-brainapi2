@@ -1,0 +1,271 @@
+"""
+File: /embeddings.py
+Created Date: Sunday October 19th 2025
+Author: Christian Nonis <alch.infoemail@gmail.com>
+-----
+Last Modified: Thursday January 29th 2026 8:43:59 pm
+Modified By: Christian Nonis <alch.infoemail@gmail.com>
+-----
+"""
+
+import uuid
+try:
+    from tenacity import (
+        retry,
+        stop_after_attempt,
+        wait_exponential,
+        retry_if_exception_type,
+        RetryError,
+    )
+except ModuleNotFoundError:
+    def retry(*args, **kwargs):
+        def _decorator(func):
+            return func
+
+        return _decorator
+
+    def stop_after_attempt(*args, **kwargs):
+        return None
+
+    def wait_exponential(*args, **kwargs):
+        return None
+
+    def retry_if_exception_type(*args, **kwargs):
+        return None
+
+    class RetryError(Exception):
+        pass
+
+from src.adapters.interfaces.embeddings import EmbeddingsClient, VectorStoreClient
+from src.constants.embeddings import Vector
+try:
+    from src.lib.embeddings.client import EmbeddingError
+except ModuleNotFoundError:
+    class EmbeddingError(Exception):
+        pass
+
+
+class EmbeddingFailureStrategy:
+    def on_single_failure(self, error: EmbeddingError) -> Vector:
+        raise NotImplementedError
+
+    def on_batch_failure(self, error: EmbeddingError, count: int) -> list[Vector]:
+        raise NotImplementedError
+
+
+class ReturnEmptyVectorStrategy(EmbeddingFailureStrategy):
+    def on_single_failure(self, error: EmbeddingError) -> Vector:
+        print(f"Embedding failed in adapter, returning empty vector: {error}")
+        return Vector(id=str(uuid.uuid4()), embeddings=[], metadata={})
+
+    def on_batch_failure(self, error: EmbeddingError, count: int) -> list[Vector]:
+        print(f"Embedding failed in adapter, returning empty vectors: {error}")
+        return [Vector(id=str(uuid.uuid4()), embeddings=[], metadata={}) for _ in range(count)]
+
+
+class RaiseEmbeddingFailureStrategy(EmbeddingFailureStrategy):
+    def on_single_failure(self, error: EmbeddingError) -> Vector:
+        raise error
+
+    def on_batch_failure(self, error: EmbeddingError, count: int) -> list[Vector]:
+        raise error
+
+
+class EmbeddingsAdapter:
+    def __init__(self, failure_strategy: EmbeddingFailureStrategy | None = None):
+        self.embeddings = None
+        self.failure_strategy = failure_strategy or ReturnEmptyVectorStrategy()
+
+    def add_client(self, client: EmbeddingsClient) -> None:
+        """
+        Add a embeddings client to the adapter.
+        """
+        self.embeddings = client
+
+    def set_failure_strategy(self, strategy: EmbeddingFailureStrategy) -> None:
+        self.failure_strategy = strategy
+
+    def _to_embedding_error(self, error: Exception) -> EmbeddingError:
+        if isinstance(error, EmbeddingError):
+            return error
+        if isinstance(error, RetryError):
+            last_attempt = getattr(error, "last_attempt", None)
+            if last_attempt and hasattr(last_attempt, "exception"):
+                last_exception = last_attempt.exception()
+                if isinstance(last_exception, EmbeddingError):
+                    return last_exception
+                if isinstance(last_exception, Exception):
+                    return EmbeddingError(str(last_exception))
+        return EmbeddingError(str(error))
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type(EmbeddingError),
+    )
+    def _embed_text_with_retry(self, text: str) -> list[float]:
+        from src.core.saving.pipeline_runtime import record_embedding
+        try:
+            result = self.embeddings.embed_text(text)
+        except Exception as error:
+            record_embedding(self.embeddings, [text], error)
+            raise
+        record_embedding(self.embeddings, [text])
+        return result
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type(EmbeddingError),
+    )
+    def _embed_texts_with_retry(self, texts: list[str]) -> list[list[float]]:
+        from src.core.saving.pipeline_runtime import record_embedding
+        try:
+            result = self.embeddings.embed_texts(texts)
+        except Exception as error:
+            record_embedding(self.embeddings, texts, error)
+            raise
+        record_embedding(self.embeddings, texts)
+        return result
+
+    def embed_text(self, text: str) -> Vector:
+        """
+        Embed a text and return a vector.
+        """
+        try:
+            embeddings = self._embed_text_with_retry(text)
+            return Vector(id=str(uuid.uuid4()), embeddings=embeddings, metadata={})
+        except (EmbeddingError, RetryError) as e:
+            return self.failure_strategy.on_single_failure(self._to_embedding_error(e))
+
+    def embed_texts(self, texts: list[str]) -> list[Vector]:
+        """
+        Embed a list of texts and return a list of vectors.
+        """
+        try:
+            embeddings_list = self._embed_texts_with_retry(texts)
+            return [
+                Vector(id=str(uuid.uuid4()), embeddings=embeddings, metadata={})
+                for embeddings in embeddings_list
+            ]
+        except (EmbeddingError, RetryError) as e:
+            return self.failure_strategy.on_batch_failure(
+                self._to_embedding_error(e), len(texts)
+            )
+
+
+class VectorStoreAdapter:
+    def __init__(self):
+        self.vector_store = None
+
+    def add_client(self, client: VectorStoreClient) -> None:
+        """
+        Add a vector store client to the adapter.
+        """
+        self.vector_store = client
+
+    def add_vectors(
+        self, vectors: list[Vector], store: str, brain_id: str = "default"
+    ) -> list[str]:
+        """
+        Add vectors to the vector store.
+        """
+        from src.core.saving.ingest_write_buffer import capture_vector_write
+
+        if capture_vector_write(brain_id, vectors, store):
+            from src.lib.postgresql.vectors import string_to_int64
+
+            return [string_to_int64(vector.id) for vector in vectors]
+        return self.vector_store.add_vectors(vectors, store, brain_id)
+
+    def search_vectors(
+        self,
+        data_vector: list[float],
+        brain_id: str = "default",
+        store: str = "default",
+        k: int = 10,
+    ) -> list[Vector]:
+        """
+        Search vectors in the vector store and return the top k vectors.
+        """
+        from src.utils.vector_search import stable_top_k_vectors
+
+        vectors = self.vector_store.search_vectors(data_vector, brain_id, store, k)
+        return stable_top_k_vectors(list(vectors), k)
+
+    def get_by_ids(
+        self, ids: list[str], store: str, brain_id: str = "default"
+    ) -> list[Vector]:
+        """
+        Get vectors by their IDs.
+        """
+        from src.core.saving.ingest_write_buffer import staged_vector_records
+
+        staged = staged_vector_records(brain_id, store, ids)
+        if staged:
+            missing = [vector_id for vector_id in ids if str(vector_id) not in staged]
+            live = self.vector_store.get_by_ids(missing, store, brain_id) if missing else []
+            return [*live, *(Vector.model_validate(value) for value in staged.values() if value)]
+        return self.vector_store.get_by_ids(ids, store, brain_id)
+
+    def search_similar_by_ids(
+        self,
+        vector_ids: list[str],
+        brain_id: str,
+        store: str,
+        min_similarity: float,
+        limit: int = 10,
+    ) -> dict[str, list[Vector]]:
+        """
+        Finds vectors similar to the provided vector IDs within a specified store and brain.
+
+        Parameters:
+            vector_ids (list[str]): IDs of the source vectors to find similarities for.
+            brain_id (str): Identifier of the brain/namespace to search within.
+            store (str): Name of the vector store to query.
+            min_similarity (float): Minimum similarity threshold for returned vectors (inclusive).
+            limit (int): Maximum number of similar vectors to return per source ID.
+
+        Returns:
+            dict[str, list[Vector]]: Mapping from each source vector ID to a list of similar Vectors.
+            Each list contains at most `limit` items, includes only vectors with similarity >= `min_similarity`,
+            and is ordered by descending similarity.
+        """
+        return self.vector_store.search_similar_by_ids(
+            vector_ids, brain_id, store, min_similarity, limit
+        )
+
+    def remove_vectors(
+        self, ids: list[str], store: str, brain_id: str = "default"
+    ) -> None:
+        """
+        Remove vectors from the vector store.
+        """
+        from src.core.saving.ingest_write_buffer import capture_operation
+
+        if capture_operation(brain_id, {
+            "adapter": "vector",
+            "method": "remove_vectors",
+            "args": {"ids": list(ids), "store": store},
+        }):
+            return None
+        return self.vector_store.remove_vectors(ids, store, brain_id)
+
+    def list_vectors(
+        self,
+        store: str,
+        brain_id: str = "default",
+        limit: int = 10,
+        skip: int = 0,
+        include_embeddings: bool = False,
+    ) -> tuple[list[Vector], int]:
+        """
+        List vectors in a store with pagination.
+        """
+        return self.vector_store.list_vectors(
+            store, brain_id, limit, skip, include_embeddings
+        )
+
+
+_embeddings_adapter = EmbeddingsAdapter()
+_vector_store_adapter = VectorStoreAdapter()

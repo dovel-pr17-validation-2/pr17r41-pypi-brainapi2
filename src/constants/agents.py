@@ -1,0 +1,128 @@
+"""
+File: /agents.py
+Created Date: Thursday January 15th 2026
+Author: Christian Nonis <alch.infoemail@gmail.com>
+-----
+Last Modified: Thursday January 15th 2026 8:55:23 pm
+Modified By: Christian Nonis <alch.infoemail@gmail.com>
+-----
+"""
+
+from pydantic import BaseModel, Field
+from typing import Literal, Optional, List, Tuple
+import uuid
+
+
+class ArchitectAgentEntity(BaseModel):
+    """
+    Architect agent entity.
+    """
+
+    uuid: str
+    name: str
+    type: str
+    happened_at: Optional[str | None] = Field(
+        default=None,
+        description="The date and time the entity happened at if known otherwise None. Mostly used for event entities.",
+    )
+    description: Optional[str] = None
+    properties: Optional[dict] = Field(default_factory=dict)
+    polarity: Optional[Literal["positive", "negative", "neutral"]] = Field(
+        default="neutral",
+        description="The polarity of the entity.",
+    )
+
+
+class _ArchitectAgentNew(BaseModel):
+    """
+    Architect agent new entity.
+    """
+
+    temp_id: str
+    type: str
+    name: str
+    reason: str
+    properties: Optional[dict] = Field(default_factory=dict)
+    description: Optional[str] = None
+
+
+class ArchitectAgentNew(BaseModel):
+    """
+    Architect agent new entity.
+    """
+
+    uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    type: str
+    name: str
+    reason: str
+    properties: Optional[dict] = Field(default_factory=dict)
+    description: Optional[str] = None
+
+
+class _ArchitectAgentRelationship(BaseModel):
+    """
+    Architect agent relationship.
+    """
+
+    tail: ArchitectAgentEntity = Field(
+        description="The SOURCE of the relationship (the subject/origin where the arrow starts, e.g. the Actor in 'Actor --MADE--> Event')."
+    )
+    name: str
+    properties: Optional[dict] = Field(default_factory=dict)
+    description: Optional[str] = None
+    tip: ArchitectAgentEntity = Field(
+        description="The DESTINATION of the relationship (the object/target where the arrow points, e.g. the Event in 'Actor --MADE--> Event')."
+    )
+    amount: Optional[float] = Field(
+        default=None,
+        description="The amount of the relationship.",
+    )
+
+
+class ArchitectAgentRelationship(_ArchitectAgentRelationship):
+    """
+    Architect agent relationship.
+    """
+
+    uuid: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    flow_key: str
+
+
+class _ArchitectAgentResponse(BaseModel):
+    """
+    Architect agent response containing the created relationships
+    between the entities.
+    """
+
+    new_nodes: List[_ArchitectAgentNew]
+    relationships: List[_ArchitectAgentRelationship]
+
+
+class ArchitectAgentResponse(BaseModel):
+    """
+    Architect agent response containing the created relationships
+    between the entities.
+    """
+
+    new_nodes: List[ArchitectAgentNew]
+    relationships: List[ArchitectAgentRelationship]
+
+
+class AtomicJanitorAgentWrongRelationship(BaseModel):
+    relationship: _ArchitectAgentRelationship
+    reason: str
+    instructions: str
+
+
+class AtomicJanitorAgentInputOutput(BaseModel):
+    status: Literal["OK", "ERROR", "REJECT"] = Field(default="ERROR")
+
+    fixed_relationships: Optional[List[_ArchitectAgentRelationship]] = None
+    wrong_relationships: Optional[List[AtomicJanitorAgentWrongRelationship]] = None
+    required_new_nodes: Optional[List[ArchitectAgentNew]] = None
+    # Explicit veto notes when status == REJECT (audit); edges are not approved.
+    veto_reasons: Optional[List[str]] = None
+
+
+class GraphConsolidatorOutput(BaseModel):
+    tasks: List[str] = Field(default_factory=list)
